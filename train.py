@@ -99,6 +99,18 @@ RANK = int(os.getenv("RANK", -1))
 WORLD_SIZE = int(os.getenv("WORLD_SIZE", 1))
 GIT_INFO = check_git_info()
 
+#===== load model =====
+# import model
+# print('===> Loading model')
+# aodnet = torch.load('/home/golangboy/chz/yolov5/AODnet-by-pytorch/model_pretrained/AOD_net_epoch_relu_10.pth')
+# #
+# for name, param in aodnet.named_parameters():
+#     param.requires_grad = False
+import torchvision.transforms as transforms
+from torch.autograd import Variable
+transform =  transforms.Compose([
+    transforms.Normalize(mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5))  # 归一化
+    ])
 
 def train(hyp, opt, device, callbacks):
     """
@@ -360,6 +372,9 @@ def train(hyp, opt, device, callbacks):
             callbacks.run("on_train_batch_start")
             ni = i + nb * epoch  # number integrated batches (since train start)
             imgs = imgs.to(device, non_blocking=True).float() / 255  # uint8 to float32, 0-255 to 0.0-1.0
+            # imgs=transform(imgs)
+            # imgs2=aodnet(imgs)
+
 
             # Warmup
             if ni <= nw:
@@ -390,6 +405,7 @@ def train(hyp, opt, device, callbacks):
                     loss *= 4.0
 
             # Backward
+            torch.use_deterministic_algorithms(False)  #添加部分
             scaler.scale(loss).backward()
 
             # Optimize - https://pytorch.org/docs/master/notes/amp_examples.html
@@ -516,12 +532,12 @@ def train(hyp, opt, device, callbacks):
 def parse_opt(known=False):
     """Parses command-line arguments for YOLOv5 training, validation, and testing."""
     parser = argparse.ArgumentParser()
-    parser.add_argument("--weights", type=str, default=ROOT / "yolov5s.pt", help="initial weights path")
-    parser.add_argument("--cfg", type=str, default="", help="model.yaml path")
-    parser.add_argument("--data", type=str, default=ROOT / "data/coco128.yaml", help="dataset.yaml path")
+    parser.add_argument("--weights", type=str, default="", help="initial weights path")
+    parser.add_argument("--cfg", type=str, default="/home/golangboy/chz/yolov5/models/yolov5s.yaml", help="model.yaml path")
+    parser.add_argument("--data", type=str, default="/home/golangboy/chz/yolov5/yolodata/fog.yaml", help="dataset.yaml path")
     parser.add_argument("--hyp", type=str, default=ROOT / "data/hyps/hyp.scratch-low.yaml", help="hyperparameters path")
-    parser.add_argument("--epochs", type=int, default=100, help="total training epochs")
-    parser.add_argument("--batch-size", type=int, default=16, help="total batch size for all GPUs, -1 for autobatch")
+    parser.add_argument("--epochs", type=int, default=130, help="total training epochs")
+    parser.add_argument("--batch-size", type=int, default=32, help="total batch size for all GPUs, -1 for autobatch")
     parser.add_argument("--imgsz", "--img", "--img-size", type=int, default=640, help="train, val image size (pixels)")
     parser.add_argument("--rect", action="store_true", help="rectangular training")
     parser.add_argument("--resume", nargs="?", const=True, default=False, help="resume most recent training")

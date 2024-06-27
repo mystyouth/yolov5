@@ -68,7 +68,358 @@ try:
 except ImportError:
     thop = None
 
+import torch.nn as nn
+class ChannelAttention(nn.Module):
+    def __init__(self, in_planes, ratio=16):
+        super(ChannelAttention, self).__init__()
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.max_pool = nn.AdaptiveMaxPool2d(1)
+        self.f1 = nn.Conv2d(in_planes, in_planes // ratio, 1, bias=False)
+        self.relu = nn.ReLU()
+        self.f2 = nn.Conv2d(in_planes // ratio, in_planes, 1, bias=False)
+        self.sigmoid = nn.Sigmoid()
+ 
+    def forward(self, x):
+        avg_out = self.f2(self.relu(self.f1(self.avg_pool(x))))
+        max_out = self.f2(self.relu(self.f1(self.max_pool(x))))
+        out = self.sigmoid(avg_out + max_out)
+        return out
+ 
+ 
+class SpatialAttention(nn.Module):
+    def __init__(self, kernel_size=7):
+        super(SpatialAttention, self).__init__()
+        assert kernel_size in (3, 7), 'kernel size must be 3 or 7'
+        padding = 3 if kernel_size == 7 else 1
+        # (特征图的大小-算子的size+2*padding)/步长+1
+        self.conv = nn.Conv2d(2, 1, kernel_size, padding=padding, bias=False)
+        self.sigmoid = nn.Sigmoid()
+ 
+    def forward(self, x):
+        # 1*h*w
+        avg_out = torch.mean(x, dim=1, keepdim=True)
+        max_out, _ = torch.max(x, dim=1, keepdim=True)
+        x = torch.cat([avg_out, max_out], dim=1)
+        #2*h*w
+        x = self.conv(x)
+        #1*h*w
+        return self.sigmoid(x)
+ 
+ 
+class CBAM(nn.Module):
+    # CSP Bottleneck with 3 convolutions
+    def __init__(self, c1, c2, ratio=16, kernel_size=7):  # ch_in, ch_out, number, shortcut, groups, expansion
+        super(CBAM, self).__init__()
+        self.channel_attention = ChannelAttention(c1, ratio)
+        self.spatial_attention = SpatialAttention(kernel_size)
+ 
+    def forward(self, x):
+        out = self.channel_attention(x) * x
+        # c*h*w
+        # c*h*w * 1*h*w
+        out = self.spatial_attention(out) * out
+        return out
+    
+# ---------------------------- GSConv ---------------------------------
+class GSConv(nn.Module):
+    def __init__(self, c1, c2, k=1, s=1, g=1, act=True):
+        super().__init__()
+        c_ = c2 // 2
+        self.cv1 = Conv(c1, c_, k, s, None, g, act)
+        self.cv2 = Conv(c_, c_, 5, 1, None, c_, act)
+ 
+    def forward(self, x):
+        x1 = self.cv1(x)
+        x2 = torch.cat((x1, self.cv2(x1)), 1)
+        # shuffle
+        # y = x2.reshape(x2.shape[0], 2, x2.shape[1] // 2, x2.shape[2], x2.shape[3])
+        # y = y.permute(0, 2, 1, 3, 4)
+        # return y.reshape(y.shape[0], -1, y.shape[3], y.shape[4])
+ 
+        b, n, h, w = x2.data.size()
+        b_n = b * n // 2
+        y = x2.reshape(b_n, 2, h * w)
+        y = y.permute(1, 0, 2)
+        y = y.reshape(2, -1, n // 2, h, w)
+ 
+        return torch.cat((y[0], y[1]), 1)
+ 
+ 
+class GSConvns(GSConv):
+    def __init__(self, c1, c2, k=1, s=1, g=1, act=True):
+        super().__init__(c1, c2, k=1, s=1, g=1, act=True)
+        c_ = c2 // 2
+        self.shuf = nn.Conv2d(c_ * 2, c2, 1, 1, 0, bias=False)
+ 
+    def forward(self, x):
+        x1 = self.cv1(x)
+        x2 = torch.cat((x1, self.cv2(x1)), 1)
+        # normative-shuffle, TRT supported
+        return nn.ReLU(self.shuf(x2))
+ 
+ 
+class GSBottleneck(nn.Module):
+    def __init__(self, c1, c2, k=3, s=1):
+        super().__init__()
+        c_ = c2 // 2
+        # for lighting
+        self.conv_lighting = nn.Sequential(
+            GSConv(c1, c_, 1, 1),
+            GSConv(c_, c2, 1, 1, act=False))
+        # for receptive field
+        self.conv = nn.Sequential(
+            GSConv(c1, c_, 3, 1),
+            GSConv(c_, c2, 3, 1, act=False))
+        self.shortcut = Conv(c1, c2, 3, 1, act=False)
+ 
+    def forward(self, x):
+        return self.conv_lighting(x) + self.shortcut(x)
+ 
+ 
+class DWConv(Conv):
+    # Depth-wise convolution
+    def __init__(self, c1, c2, k=1, s=1, d=1, act=True):  # ch_in, ch_out, kernel, stride, dilation, activation
+        super().__init__(c1, c2, k, s, g=math.gcd(c1, c2), d=d, act=act)
+ 
+ 
+class GSBottleneckC(GSBottleneck):
+    def __init__(self, c1, c2, k=3, s=1):
+        super().__init__(c1, c2, k, s)
+        self.shortcut = DWConv(c1, c2, 3, 1, act=False)
+ 
+ 
+class VoVGSCSP(nn.Module):
+    # VoVGSCSP module with GSBottleneck
+    def __init__(self, c1, c2, n=1, shortcut=True, g=1, e=0.5):
+        super().__init__()
+        c_ = int(c2 * e)  # hidden channels
+        self.cv1 = Conv(c1, c_, 1, 1)
+        self.cv2 = Conv(c1, c_, 1, 1)
+        # self.gc1 = GSConv(c_, c_, 1, 1)
+        # self.gc2 = GSConv(c_, c_, 1, 1)
+        self.gsb = GSBottleneck(c_, c_, 1, 1)
+        self.res = Conv(c_, c_, 3, 1, act=False)
+        self.cv3 = Conv(2 * c_, c2, 1)  #
+ 
+    def forward(self, x):
+        x1 = self.gsb(self.cv1(x))
+        y = self.cv2(x)
+        return self.cv3(torch.cat((y, x1), dim=1))
+ 
+ 
+class VoVGSCSPC(nn.Module):
+    # cheap VoVGSCSP module with GSBottleneck
+    def __init__(self, c1, c2, n=1, shortcut=True, g=1, e=0.5):
+        super().__init__()
+        c_ = int(c2 * e)  # hidden channels
+        self.gsb = GSBottleneckC(c_, c_, 1, 1)
+# ---------------------------- end ---------------------------------
+import torch
+import torch.nn as nn
 
+
+class ECA(nn.Module):
+    def __init__(self, c1, c2, k_size=3):
+        super(ECA, self).__init__()
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.conv = nn.Conv1d(
+            1, 1, kernel_size=k_size, padding=(k_size - 1) // 2, bias=False
+        )
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        y = self.avg_pool(x)
+        y = self.conv(y.squeeze(-1).transpose(-1, -2)).transpose(-1, -2).unsqueeze(-1)
+        y = self.sigmoid(y)
+        return x * y.expand_as(x)
+
+class SE_Block(nn.Module):
+    def __init__(self, c1, c2):
+        super().__init__()
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)  # 平均池化
+        self.fc = nn.Sequential(
+            nn.Linear(c1, c2 // 16, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Linear(c2 // 16, c2, bias=False),
+            nn.Sigmoid()
+        )
+ 
+    def forward(self, x):
+        # 添加注意力模块
+        b, c, _, _ = x.size()  # 分别获取batch_size,channel
+        y = self.avg_pool(x).view(b, c)  # y的shape为【batch_size, channels】
+        y = self.fc(y).view(b, c, 1, 1)  # shape为【batch_size, channels, 1, 1】
+        out = x * y.expand_as(x)  # shape 为【batch, channels,feature_w, feature_h】
+        return out
+    
+def channel_shuffle(x, groups=2):   ##shuffle channel 
+        #RESHAPE----->transpose------->Flatten 
+        B, C, H, W = x.size()
+        out = x.view(B, groups, C // groups, H, W).permute(0, 2, 1, 3, 4).contiguous()
+        out=out.view(B, C, H, W) 
+        return out
+ 
+class GAM_Attention(nn.Module):
+   #https://paperswithcode.com/paper/global-attention-mechanism-retain-information
+    def __init__(self, c1, c2, group=True,rate=4):
+        super(GAM_Attention, self).__init__()
+        
+        self.channel_attention = nn.Sequential(
+            nn.Linear(c1, int(c1 / rate)),
+            nn.ReLU(inplace=True),
+            nn.Linear(int(c1 / rate), c1)
+        )
+        
+        
+        self.spatial_attention = nn.Sequential(
+            
+            nn.Conv2d(c1, c1//rate, kernel_size=7, padding=3,groups=rate)if group else nn.Conv2d(c1, int(c1 / rate), kernel_size=7, padding=3), 
+            nn.BatchNorm2d(int(c1 /rate)),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(c1//rate, c2, kernel_size=7, padding=3,groups=rate) if group else nn.Conv2d(int(c1 / rate), c2, kernel_size=7, padding=3), 
+            nn.BatchNorm2d(c2)
+        )
+ 
+    def forward(self, x):
+        
+        b, c, h, w = x.shape
+        x_permute = x.permute(0, 2, 3, 1).view(b, -1, c)
+        x_att_permute = self.channel_attention(x_permute).view(b, h, w, c)
+        x_channel_att = x_att_permute.permute(0, 3, 1, 2)
+       # x_channel_att=channel_shuffle(x_channel_att,4) #last shuffle 
+        x = x * x_channel_att
+ 
+        x_spatial_att = self.spatial_attention(x).sigmoid()
+        x_spatial_att=channel_shuffle(x_spatial_att,4) #last shuffle 
+        out = x * x_spatial_att
+        #out=channel_shuffle(out,4) #last shuffle 
+        return out    
+import torch
+import torch.nn as nn
+ 
+ 
+class SimAM(torch.nn.Module):
+ 
+    # 不需要接收通道数输入
+    def __init__(self, e_lambda=1e-4):
+        super(SimAM, self).__init__()
+ 
+        self.activaton = nn.Sigmoid()
+        self.e_lambda = e_lambda
+ 
+    def __repr__(self):
+        s = self.__class__.__name__ + '('
+        s += ('lambda=%f)' % self.e_lambda)
+        return s
+ 
+    @staticmethod
+    def get_module_name():
+        return "simam"
+ 
+    def forward(self, x):
+        b, c, h, w = x.size()
+ 
+        n = w * h - 1
+ 
+        x_minus_mu_square = (x - x.mean(dim=[2, 3], keepdim=True)).pow(2)
+        y = x_minus_mu_square / (4 * (x_minus_mu_square.sum(dim=[2, 3], keepdim=True) / n + self.e_lambda)) + 0.5
+ 
+        return x * self.activaton(y)
+class Bottle2neck(nn.Module):
+    expansion = 1
+ 
+    def __init__(self, inplanes, planes, shortcut, baseWidth=26, scale=4):
+        """ Constructor
+        Args:
+            inplanes: input channel dimensionality
+            planes: output channel dimensionality
+            baseWidth: basic width of conv3x3
+            scale: number of scale.
+        """
+        super(Bottle2neck, self).__init__()
+ 
+        width = int(math.floor(planes * (baseWidth / 64.0)))
+        self.conv1 = Conv(inplanes, width * scale, k=1)
+ 
+        if scale == 1:
+            self.nums = 1
+        else:
+            self.nums = scale - 1
+        convs = []
+        for i in range(self.nums):
+            convs.append(Conv(width, width, k=3))
+        self.convs = nn.ModuleList(convs)
+ 
+        self.conv3 = Conv(width * scale, planes * self.expansion, k=1, act=False)
+ 
+        self.silu = nn.SiLU(inplace=True)
+        self.scale = scale
+        self.width = width
+        self.shortcut = shortcut
+ 
+    def forward(self, x):
+ 
+        if self.shortcut:
+            residual = x
+        out = self.conv1(x)
+        spx = torch.split(out, self.width, 1)
+        for i in range(self.nums):
+            if i == 0:
+                sp = spx[i]
+            else:
+                sp = sp + spx[i]
+            sp = self.convs[i](sp)
+            if i == 0:
+                out = sp
+            else:
+                out = torch.cat((out, sp), 1)
+        if self.scale != 1:
+            out = torch.cat((out, spx[self.nums]), 1)
+ 
+        out = self.conv3(out)
+        #print(out.shape)
+        if self.shortcut:
+            out += residual
+        out = self.silu(out)
+        return out
+ 
+ 
+class C3_Res2Block(C3):
+    # CSP Bottleneck with 3 convolutions
+    def __init__(self, c1, c2, n=1, shortcut=True, g=1, e=0.5):  # ch_in, ch_out, number, shortcut, groups, expansion
+        super().__init__(c1, c2, n, shortcut, g, e)
+        c_ = int(c2 * e)  # hidden channels
+        self.m = nn.Sequential(*(Bottle2neck(c_, c_, shortcut) for _ in range(n)))
+import math
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F 
+class AODnet(nn.Module):   
+    def __init__(self):
+        super(AODnet, self).__init__()
+        self.conv1 = nn.Conv2d(in_channels=3, out_channels=3, kernel_size=1)
+        self.conv2 = nn.Conv2d(in_channels=3, out_channels=3, kernel_size=3, padding=1)
+        self.conv3 = nn.Conv2d(in_channels=6, out_channels=3, kernel_size=5, padding=2)
+        self.conv4 = nn.Conv2d(in_channels=6, out_channels=3, kernel_size=7, padding=3)
+        self.conv5 = nn.Conv2d(in_channels=12, out_channels=3, kernel_size=3, padding=1)
+        self.b = 1
+
+    def forward(self, x):  
+        x1 = F.relu(self.conv1(x))+x
+        x2 = F.relu(self.conv2(x1))+x1
+        cat1 = torch.cat((x1, x2), 1)
+        x3 = F.relu(self.conv3(cat1))
+        cat2 = torch.cat((x2, x3),1)
+        x4 = F.relu(self.conv4(cat2))
+        cat3 = torch.cat((x1, x2, x3, x4),1)
+        k = F.relu(self.conv5(cat3))
+
+        if k.size() != x.size():
+            raise Exception("k, haze image are different size!")
+
+        output = k * x - k + self.b
+        return k+x
 class Detect(nn.Module):
     # YOLOv5 Detect head for detection models
     stride = None  # strides computed during build
@@ -415,13 +766,24 @@ def parse_model(d, ch):
             nn.ConvTranspose2d,
             DWConvTranspose2d,
             C3x,
+            CBAM,
+            GSConv,
+            VoVGSCSP,
+            VoVGSCSPC,
+            ECA,
+            SE_Block,
+            GAM_Attention,
+            C3_Res2Block
         }:
             c1, c2 = ch[f], args[0]
             if c2 != no:  # if not output
                 c2 = make_divisible(c2 * gw, ch_mul)
 
             args = [c1, c2, *args[1:]]
-            if m in {BottleneckCSP, C3, C3TR, C3Ghost, C3x}:
+            if m in {BottleneckCSP, C3, C3TR, C3Ghost, C3x,
+            VoVGSCSP,
+            C3_Res2Block,
+            VoVGSCSPC,}:
                 args.insert(2, n)  # number of repeats
                 n = 1
         elif m is nn.BatchNorm2d:
